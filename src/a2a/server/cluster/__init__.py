@@ -7,8 +7,6 @@ multiple replicas behind a load balancer without task affinity:
   concurrent writes across replicas are safe.
 * `LegacyTaskStoreAdapter` wraps an existing `TaskStore` so it satisfies the
   versioned interface (with last-writer-wins semantics).
-* `VersionedInMemoryTaskStore` and `VersionedDatabaseTaskStore` are concrete
-  compare-and-set implementations.
 
 These are additive: a single-process deployment that does not use them keeps its
 current behaviour unchanged.
@@ -16,6 +14,8 @@ current behaviour unchanged.
 
 import logging
 
+from a2a.server.cluster.event_bus import TaskEventBus, VersionedEvent
+from a2a.server.cluster.inmemory_event_bus import InMemoryTaskEventBus
 from a2a.server.cluster.inmemory_task_store import (
     VersionedInMemoryTaskStore,
 )
@@ -31,6 +31,7 @@ from a2a.server.cluster.version import TaskVersion
 logger = logging.getLogger(__name__)
 
 try:
+    from a2a.server.cluster.database_event_bus import DatabaseTaskEventBus
     from a2a.server.cluster.database_task_store import (
         VersionedDatabaseTaskStore,
     )
@@ -51,13 +52,26 @@ except ImportError as e:
                 "installed. Install with 'pip install a2a-sdk[sql]'."
             ) from _original_error
 
+    class DatabaseTaskEventBus:  # type: ignore[no-redef]
+        """Placeholder when database dependencies are not installed."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ImportError(
+                'To use DatabaseTaskEventBus, its dependencies must be '
+                "installed. Install with 'pip install a2a-sdk[sql]'."
+            ) from _original_error
+
 
 __all__ = [
     'ConcurrentTaskModificationError',
+    'DatabaseTaskEventBus',
+    'InMemoryTaskEventBus',
     'LegacyTaskStoreAdapter',
     'PlainTaskStoreView',
+    'TaskEventBus',
     'TaskVersion',
     'VersionedDatabaseTaskStore',
+    'VersionedEvent',
     'VersionedInMemoryTaskStore',
     'VersionedTaskStore',
 ]
