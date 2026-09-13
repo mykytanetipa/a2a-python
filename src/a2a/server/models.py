@@ -15,7 +15,15 @@ from a2a.types.a2a_pb2 import Artifact, Message, TaskStatus
 
 
 try:
-    from sqlalchemy import JSON, DateTime, Index, LargeBinary, String
+    from sqlalchemy import (
+        JSON,
+        BigInteger,
+        DateTime,
+        Index,
+        Integer,
+        LargeBinary,
+        String,
+    )
     from sqlalchemy.orm import (
         DeclarativeBase,
         Mapped,
@@ -58,6 +66,12 @@ class TaskMixin:
     history: Mapped[list[Message] | None] = mapped_column(JSON, nullable=True)
     protocol_version: Mapped[str | None] = mapped_column(
         String(16), nullable=True
+    )
+    # Optimistic-concurrency version, used by the clustered VersionedTaskStore
+    # (a2a.server.cluster). Nullable and defaulted so existing rows and the
+    # non-versioned DatabaseTaskStore are unaffected: they simply leave it NULL.
+    version: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, default=None
     )
 
     # Using declared_attr to avoid conflict with Pydantic's metadata
@@ -192,3 +206,56 @@ class PushNotificationConfigModel(PushNotificationConfigMixin, Base):
     """Default push notification config model with standard table name."""
 
     __tablename__ = 'push_notification_configs'
+
+
+# TaskEventMixin: append-only log of task events for the clustered event bus.
+class TaskEventMixin:
+    """Mixin providing columns for an append-only task-event log.
+
+    Written transactionally with the task row by the clustered
+    `VersionedTaskStore` and read by `DatabaseTaskEventBus`. Only used by
+    `a2a.server.cluster`; unused by the default single-process stores.
+    """
+
+    # Monotonic sequence id, primary source of ordering for the poller.
+    # BigInteger everywhere except SQLite, whose AUTOINCREMENT requires the
+    # column to be a plain INTEGER.
+    seq: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, 'sqlite'),
+        primary_key=True,
+        autoincrement=True,
+    )
+    task_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    owner: Mapped[str] = mapped_column(String(255), nullable=True)
+    # Task version produced by applying this event.
+    task_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Serialized StreamResponse proto for the event.
+    event_data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    @override
+    def __repr__(self) -> str:
+        """Return a string representation of the task event."""
+        return (
+            f'<{self.__class__.__name__}(seq={getattr(self, "seq", None)}, '
+            f'task_id="{self.task_id}", task_version={self.task_version})>'
+        )
+
+
+def create_task_event_model(
+    table_name: str = 'task_events', base: type[DeclarativeBase] = Base
+) -> type:
+    """Create a TaskEventModel class with a configurable table name."""
+
+    class TaskEventModel(TaskEventMixin, base):  # type: ignore
+        __tablename__ = table_name
+
+    TaskEventModel.__name__ = f'TaskEventModel_{table_name}'
+    TaskEventModel.__qualname__ = f'TaskEventModel_{table_name}'
+    return TaskEventModel
+
+
+# Default TaskEventModel for backward compatibility.
+class TaskEventModel(TaskEventMixin, Base):
+    """Default task-event model with standard table name."""
+
+    __tablename__ = 'task_events'
