@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import logging
 
-from a2a.server.context import ServerCallContext
-from a2a.server.events.event_queue import Event
-from a2a.server.tasks.task_store import TaskStore
+from typing import TYPE_CHECKING
+
 from a2a.types.a2a_pb2 import (
     Artifact,
     Message,
@@ -14,6 +15,14 @@ from a2a.types.a2a_pb2 import (
 )
 from a2a.utils.errors import InvalidAgentResponseError, InvalidParamsError
 from a2a.utils.telemetry import trace_function
+
+
+if TYPE_CHECKING:
+    from a2a.server.cluster.task_store import VersionedTaskStore
+    from a2a.server.cluster.version import TaskVersion
+    from a2a.server.context import ServerCallContext
+    from a2a.server.events.event_queue import Event
+    from a2a.server.tasks.task_store import TaskStore
 
 
 logger = logging.getLogger(__name__)
@@ -96,7 +105,7 @@ class TaskManager:
 
     def __init__(
         self,
-        task_store: TaskStore,
+        task_store: TaskStore | VersionedTaskStore,
         context: ServerCallContext,
         task_id: str | None,
         context_id: str | None,
@@ -105,7 +114,11 @@ class TaskManager:
         """Initializes the TaskManager.
 
         Args:
-            task_store: The `TaskStore` instance for persistence.
+            task_store: The `TaskStore` (or `VersionedTaskStore`) for
+                persistence. A plain `TaskStore` is wrapped in
+                `LegacyTaskStoreAdapter`, so no optimistic-concurrency check is
+                performed (last-writer-wins, i.e. current behaviour). Pass a
+                `VersionedTaskStore` to enable compare-and-swap.
             context: The `ServerCallContext` that this task is produced under.
             task_id: The ID of the task, if known from the request.
             context_id: The ID of the context, if known from the request.
@@ -115,17 +128,56 @@ class TaskManager:
         if task_id is not None and not (isinstance(task_id, str) and task_id):
             raise ValueError('Task ID must be a non-empty string')
 
+        # Imported lazily to avoid an import cycle: the cluster package imports
+        # from a2a.server.tasks, which imports this module.
+        from a2a.server.cluster.task_store import (  # noqa: PLC0415
+            LegacyTaskStoreAdapter,
+            VersionedTaskStore,
+        )
+        from a2a.server.cluster.version import TaskVersion  # noqa: PLC0415
+
+        # Keep the original object accessible, and use a versioned view for all
+        # reads/writes. For a plain TaskStore the adapter reports MISSING
+        # versions, so the compare-and-swap below is a no-op.
         self.task_store = task_store
+        self._store: VersionedTaskStore = (
+            task_store
+            if isinstance(task_store, VersionedTaskStore)
+            else LegacyTaskStoreAdapter(task_store)
+        )
         self._call_context: ServerCallContext = context
         self.task_id = task_id
         self.context_id = context_id
         self._initial_message = initial_message
         self._current_task: Task | None = None
+        # Version of `_current_task` as last read/written. MISSING until a
+        # versioned store reports a real version.
+        self._current_version: TaskVersion = TaskVersion.MISSING
+        # Transient: the event currently being persisted, read by _save_task.
+        self._pending_event: Event | None = None
         logger.debug(
             'TaskManager initialized with task_id: %s, context_id: %s',
             task_id,
             context_id,
         )
+
+    def invalidate(self) -> None:
+        """Drops the cached task snapshot so the next read hits the store.
+
+        Only safe to call at a request boundary: dropping the snapshot
+        mid-stream would lose an in-progress artifact and break the next
+        append. Used so a subsequent request re-reads state that another
+        replica may have advanced.
+        """
+        from a2a.server.cluster.version import TaskVersion  # noqa: PLC0415
+
+        self._current_task = None
+        self._current_version = TaskVersion.MISSING
+
+    @property
+    def current_version(self) -> TaskVersion:
+        """The version of the most recently read/written task snapshot."""
+        return self._current_version
 
     async def get_task(self) -> Task | None:
         """Retrieves the current task object, either from memory or the store.
@@ -146,7 +198,7 @@ class TaskManager:
         logger.debug(
             'Attempting to get task from store with id: %s', self.task_id
         )
-        self._current_task = await self.task_store.get(
+        self._current_task, self._current_version = await self._store.get(
             self.task_id, self._call_context
         )
         if self._current_task:
@@ -195,7 +247,11 @@ class TaskManager:
             task_id_from_event,
         )
         if isinstance(event, Task):
-            await self._save_task(event)
+            self._pending_event = event
+            try:
+                await self._save_task(event)
+            finally:
+                self._pending_event = None
             return event
 
         task: Task = await self.ensure_task(event)
@@ -213,7 +269,11 @@ class TaskManager:
             logger.debug('Appending artifact to task %s', task.id)
             append_artifact_to_task(task, event)
 
-        await self._save_task(task)
+        self._pending_event = event
+        try:
+            await self._save_task(task)
+        finally:
+            self._pending_event = None
         return task
 
     async def ensure_task_id(self, task_id: str, context_id: str) -> Task:
@@ -231,7 +291,9 @@ class TaskManager:
             logger.debug(
                 'Attempting to retrieve existing task with id: %s', self.task_id
             )
-            task = await self.task_store.get(self.task_id, self._call_context)
+            task, self._current_version = await self._store.get(
+                self.task_id, self._call_context
+            )
 
         if not task:
             logger.info(
@@ -302,13 +364,32 @@ class TaskManager:
         )
 
     async def _save_task(self, task: Task) -> None:
-        """Saves the given task to the task store and updates the in-memory `_current_task`.
+        """Saves the task to the store and updates the in-memory snapshot.
+
+        Threads the version the task was read at (`_current_version`) into the
+        store so a `VersionedTaskStore` can perform a compare-and-swap. When the
+        store is unversioned the version is MISSING and no check is performed.
+
+        The triggering event (if any) is read from ``self._pending_event``, set
+        by `save_task_event` around this call, so this method's signature stays
+        compatible with existing overrides.
 
         Args:
             task: The `Task` object to save.
+
+        Raises:
+            ConcurrentTaskModificationError: If the store detects a stale write.
+                Propagated so the caller (the consumer) can reload and decide.
         """
         logger.debug('Saving task with id: %s', task.id)
-        await self.task_store.save(task, self._call_context)
+        prev = self._current_task
+        self._current_version = await self._store.save(
+            task,
+            event=self._pending_event,
+            prev=prev,
+            prev_version=self._current_version,
+            context=self._call_context,
+        )
         self._current_task = task
         if not self.task_id:
             logger.info('New task created with id: %s', task.id)

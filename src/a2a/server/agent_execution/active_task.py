@@ -48,12 +48,15 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
 
     from a2a.server.agent_execution.agent_executor import AgentExecutor
+    from a2a.server.cluster.event_bus import TaskEventBus
     from a2a.server.context import ServerCallContext
     from a2a.server.tasks.push_notification_sender import (
         PushNotificationSender,
     )
     from a2a.server.tasks.task_manager import TaskManager
 
+from a2a.server.cluster.event_bus import VersionedEvent
+from a2a.server.cluster.task_store import ConcurrentTaskModificationError
 from a2a.server.events.event_queue_v2 import (
     AsyncQueue,
     Event,
@@ -79,6 +82,11 @@ from a2a.utils.errors import (
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on how long ActiveTask.cancel() waits for the producer to reach a
+# terminal state before finalizing from the current snapshot. Guards against a
+# cleanup-only or misbehaving executor.cancel() hanging the cancel RPC.
+_CANCEL_WAIT_TIMEOUT_S = 30.0
+
 
 TERMINAL_TASK_STATES = {
     TaskState.TASK_STATE_COMPLETED,
@@ -101,6 +109,36 @@ class _RequestStarted:
 class _RequestCompleted:
     def __init__(self, request_id: uuid.UUID):
         self.request_id = request_id
+
+
+def _is_publishable(event: object) -> bool:
+    """Whether an event belongs on the cross-replica event bus.
+
+    Only A2A protocol events are publishable. Lifecycle sentinels
+    (`_RequestStarted`/`_RequestCompleted`) coordinate this process's producer
+    and consumer and have no cross-replica meaning; exceptions are not
+    transferable. Those are delivered only on the in-process queues.
+    """
+    return isinstance(
+        event,
+        Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent,
+    )
+
+
+def is_final_event(event: object) -> bool:
+    """Whether an event ends a task's stream (nothing further will follow).
+
+    Used by remote subscription (a resubscribe served from the shared event
+    bus) to know when to stop tailing. A `Message` ends a message-mode
+    interaction; a status update or `Task` whose state is terminal or
+    interrupted (`input_required`/`auth_required`) ends the stream.
+    """
+    end_states = TERMINAL_TASK_STATES | INTERRUPTED_TASK_STATES
+    if isinstance(event, Message):
+        return True
+    if isinstance(event, TaskStatusUpdateEvent | Task):
+        return event.status.state in end_states
+    return False
 
 
 class EventConsumer:
@@ -154,6 +192,37 @@ class EventConsumer:
             await self._enqueue_to_subscribers(cast('Event', e), updated_task)
 
     async def _process_event(self, event: Event) -> None:
+        try:
+            await self._process_event_inner(event)
+        except ConcurrentTaskModificationError:
+            # Another writer (typically another replica) advanced this task
+            # between our read and our save. Reload and retry once against the
+            # fresh state. If the task went terminal underneath us, stop
+            # cleanly rather than overwriting the winner's state.
+            logger.info(
+                'Consumer[%s]: concurrent modification, reloading',
+                self.active_task._task_id,
+            )
+            self.active_task._task_manager.invalidate()
+            task = await self.active_task._task_manager.get_task()
+            if task is not None and task.status.state in TERMINAL_TASK_STATES:
+                # Terminal elsewhere (e.g. cancelled by another replica). Stop
+                # this execution: publish the terminal state to subscribers,
+                # cancel the producer so the running agent unwinds, then close
+                # the queues so subscriber streams end promptly (there is no
+                # _RequestCompleted coming, since the producer was aborted).
+                await self._enqueue_to_subscribers(task, task)
+                producer = self.active_task._producer_task
+                if producer is not None and not producer.done():
+                    producer.cancel()
+                await self._handle_terminal_state(task)
+                await self.active_task._event_queue_subscribers.close(
+                    immediate=False
+                )
+                return
+            await self._process_event_inner(event)
+
+    async def _process_event_inner(self, event: Event) -> None:
         updated_task = None
         handled_event: (
             Task
@@ -333,6 +402,18 @@ class EventConsumer:
         await self.active_task._event_queue_subscribers.enqueue_event(
             cast('Any', (event, updated_task))
         )
+
+        # Fan out to other replicas via the event bus. Only real protocol
+        # events are publishable; lifecycle sentinels and exceptions are
+        # process-local. Skipped entirely when no bus is configured.
+        bus = self.active_task._event_bus
+        if bus is not None and _is_publishable(event):
+            version = self.active_task._task_manager.current_version
+            await bus.publish(
+                self.active_task._task_id,
+                VersionedEvent(event=event, version=version),
+            )
+
         self.active_task._event_queue_agent.task_done()
 
 
@@ -354,13 +435,14 @@ class ActiveTask:
       permanently ceased execution and closed its queues.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         agent_executor: AgentExecutor,
         task_id: str,
         task_manager: TaskManager,
         push_sender: PushNotificationSender | None = None,
         on_cleanup: Callable[[ActiveTask], None] | None = None,
+        event_bus: TaskEventBus | None = None,
     ) -> None:
         """Initializes the ActiveTask.
 
@@ -372,6 +454,10 @@ class ActiveTask:
             on_cleanup: Optional callback triggered when the task is fully finished
                         and the last subscriber has disconnected. Used to prune
                         the task from the ActiveTaskRegistry.
+            event_bus: Optional cross-replica event bus. When provided, applied
+                        events are also published to it so other replicas can
+                        observe the task's stream. When None, only the
+                        in-process queues are used (current behaviour).
         """
         # --- Core Dependencies ---
         self._agent_executor = agent_executor
@@ -383,6 +469,9 @@ class ActiveTask:
         self._task_manager = task_manager
         self._push_sender = push_sender
         self._on_cleanup = on_cleanup
+        # Cross-replica event bus; unused for delivery until the subscribe/send
+        # paths are wired (later iteration). Stored here so it is available.
+        self._event_bus = event_bus
 
         # --- Synchronization Primitives ---
         # `_lock` protects structural lifecycle changes: start(), subscribe() counting,
@@ -418,6 +507,20 @@ class ActiveTask:
     def task_id(self) -> str:
         """The ID of the task."""
         return self._task_id
+
+    @property
+    def has_running_execution(self) -> bool:
+        """Whether this replica is actively executing the agent for this task.
+
+        True when a producer task is alive and processing a request (the
+        request lock is held). Registry presence alone is not ownership: an
+        ActiveTask created for a read-only purpose also appears there.
+        """
+        return (
+            self._producer_task is not None
+            and not self._producer_task.done()
+            and self._request_lock.locked()
+        )
 
     async def enqueue_request(
         self, request_context: RequestContext
@@ -520,6 +623,14 @@ class ActiveTask:
                 # TODO: Should we create task manager every time?
                 self._task_manager._call_context = request_context.call_context
 
+                # Request boundary: the previous turn is fully persisted (the
+                # consumer released _request_lock on _RequestCompleted), so it
+                # is safe to drop the cached snapshot and re-read. This picks up
+                # state another replica may have advanced while we were parked
+                # on _request_queue.get() (fixes the stale-snapshot reuse in
+                # multi-turn/input_required flows). Single-process, the re-read
+                # returns the same state that was just written.
+                self._task_manager.invalidate()
                 request_context.current_task = (
                     await self._task_manager.get_task()
                 )
@@ -780,7 +891,22 @@ class ActiveTask:
                     self._producer_task,
                 )
 
-        await self._is_finished.wait()
+        # Bound the wait: a cleanup-only or misbehaving executor.cancel() may
+        # never drive the task to a terminal state, which would otherwise hang
+        # this RPC forever. On timeout, fall through and write CANCELED below
+        # from the current snapshot rather than blocking indefinitely.
+        try:
+            await asyncio.wait_for(
+                self._is_finished.wait(), timeout=_CANCEL_WAIT_TIMEOUT_S
+            )
+        except TimeoutError:
+            logger.warning(
+                'Cancel[%s]: producer did not reach a terminal state within '
+                '%ss; finalizing from the current snapshot',
+                self._task_id,
+                _CANCEL_WAIT_TIMEOUT_S,
+            )
+        self._task_manager.invalidate()
         task = await self._task_manager.get_task()
         if not task:
             raise RuntimeError('Task should have been created')
