@@ -23,11 +23,36 @@ from a2a.utils.constants import (
 
 
 fastapi = pytest.importorskip('fastapi')
-from fastapi import FastAPI  # noqa: E402
+from fastapi import (  # noqa: E402
+    Depends,
+    FastAPI,
+    HTTPException,
+    Header,
+    Security,
+)
+from fastapi.security import APIKeyHeader  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from starlette.routing import Route, WebSocketRoute  # noqa: E402
 
 
 pytestmark = pytest.mark.httpx2
+
+_API_KEY = 'secret'
+_VERSION = {VERSION_HEADER: PROTOCOL_VERSION_1_0}
+
+
+def _require_key(x_api_key: str | None = Header(default=None)) -> None:
+    if x_api_key != _API_KEY:
+        raise HTTPException(status_code=403)
+
+
+def _require_key_security(
+    key: str | None = Security(
+        APIKeyHeader(name='x-api-key', auto_error=False)
+    ),
+) -> None:
+    if key != _API_KEY:
+        raise HTTPException(status_code=403)
 
 
 @pytest.fixture
@@ -40,8 +65,12 @@ def mock_handler() -> AsyncMock:
     return AsyncMock(spec=RequestHandler)
 
 
-def _build_app(agent_card: AgentCard, mock_handler: AsyncMock) -> FastAPI:
-    app = FastAPI()
+def _build_app(
+    agent_card: AgentCard,
+    mock_handler: AsyncMock,
+    app: FastAPI | None = None,
+) -> FastAPI:
+    app = app or FastAPI()
     add_a2a_routes_to_fastapi(
         app,
         agent_card_routes=create_agent_card_routes(agent_card),
@@ -186,3 +215,107 @@ def test_a2a_version_header_on_dispatcher_routes(
     assert _has_version_header(paths['/tasks']['get'])
     assert _has_version_header(paths['/tasks/{id}:cancel']['post'])
     assert not _has_version_header(paths[AGENT_CARD_WELL_KNOWN_PATH]['get'])
+
+
+_PROTECTED_REQUESTS = [
+    pytest.param('GET', AGENT_CARD_WELL_KNOWN_PATH, None, id='agent-card'),
+    pytest.param(
+        'POST',
+        '/',
+        {
+            'jsonrpc': '2.0',
+            'id': '1',
+            'method': 'GetTask',
+            'params': {'id': 't'},
+        },
+        id='jsonrpc',
+    ),
+    pytest.param('POST', '/message:send', {}, id='rest'),
+    pytest.param('GET', '/tasks/t', None, id='rest-get-task'),
+    pytest.param('POST', '/my-tenant/message:send', {}, id='rest-tenant'),
+    pytest.param('GET', '/my-tenant/tasks/t', None, id='rest-tenant-get-task'),
+]
+
+
+@pytest.mark.parametrize(('method', 'path', 'json'), _PROTECTED_REQUESTS)
+@pytest.mark.parametrize(
+    'dependency',
+    [Depends(_require_key), Security(_require_key_security)],
+    ids=['depends', 'security'],
+)
+def test_app_dependencies_guard_a2a_routes(  # noqa: PLR0913
+    agent_card: AgentCard,
+    mock_handler: AsyncMock,
+    dependency: object,
+    method: str,
+    path: str,
+    json: dict | None,
+) -> None:
+    """App-level dependencies run for every A2A route, as for any other."""
+    mock_handler.on_message_send.return_value = Task(id='t')
+    mock_handler.on_get_task.return_value = Task(id='t')
+    app = _build_app(
+        agent_card, mock_handler, FastAPI(dependencies=[dependency])
+    )
+    client = TestClient(app)
+
+    denied = client.request(method, path, json=json, headers=_VERSION)
+    assert denied.status_code == 403
+    assert not mock_handler.method_calls
+
+    allowed = client.request(
+        method, path, json=json, headers={**_VERSION, 'x-api-key': _API_KEY}
+    )
+    assert allowed.status_code == 200
+
+
+def test_app_dependencies_guard_streaming(
+    agent_card: AgentCard, mock_handler: AsyncMock
+) -> None:
+    """A rejected stream request never reaches the handler."""
+    app = _build_app(
+        agent_card, mock_handler, FastAPI(dependencies=[Depends(_require_key)])
+    )
+
+    response = TestClient(app).post(
+        '/message:stream', json={}, headers=_VERSION
+    )
+
+    assert response.status_code == 403
+    mock_handler.on_message_send_stream.assert_not_called()
+
+
+def test_tenant_routes_are_documented(mock_handler: AsyncMock) -> None:
+    """Tenant routes are registered as API routes with the REST extras."""
+    app = FastAPI()
+    add_a2a_routes_to_fastapi(app, rest_routes=create_rest_routes(mock_handler))
+    operation = app.openapi()['paths']['/{tenant}/message:send']['post']
+
+    assert operation['tags'] == [_REST_TAG]
+    assert operation['requestBody']['content']['application/json'][
+        'schema'
+    ] == {'$ref': '#/components/schemas/SendMessageRequest'}
+    assert any(p['name'] == VERSION_HEADER for p in operation['parameters'])
+
+
+def test_unsupported_route_type_is_rejected() -> None:
+    """Routes the helper cannot register are rejected, not left unguarded."""
+
+    async def endpoint(websocket: object) -> None: ...
+
+    with pytest.raises(TypeError, match='Unsupported A2A route'):
+        add_a2a_routes_to_fastapi(
+            FastAPI(), rest_routes=[WebSocketRoute('/ws', endpoint)]
+        )
+
+
+def test_route_without_methods_is_rejected() -> None:
+    """A method-less route would match every method, so it is rejected."""
+
+    async def endpoint(request: object) -> None: ...
+
+    route = Route('/raw', endpoint)
+    route.methods = None
+
+    with pytest.raises(TypeError, match='Unsupported A2A route'):
+        add_a2a_routes_to_fastapi(FastAPI(), rest_routes=[route])

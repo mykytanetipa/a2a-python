@@ -17,26 +17,19 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from fastapi import FastAPI
-    from fastapi.routing import APIRoute as _A2ARoute
-    from starlette.routing import BaseRoute, Route
+    from starlette.routing import BaseRoute, Mount, Route
 
     _package_fastapi_installed = True
 else:
     try:
-        from fastapi.routing import APIRoute
-        from starlette.routing import Route, request_response
-
-        class _A2ARoute(APIRoute):
-            """APIRoute that uses Starlette's request_response to bypass FastAPI middleware scope requirements."""
-
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                super().__init__(*args, **kwargs)
-                self.app = request_response(self.endpoint)
+        from fastapi import FastAPI
+        from starlette.routing import Mount, Route
 
         _package_fastapi_installed = True
     except ImportError:
+        FastAPI = Any
+        Mount = Any
         Route = Any
-        _A2ARoute = Any
 
         _package_fastapi_installed = False
 
@@ -81,30 +74,46 @@ def _rest_body_extra(
     return None
 
 
+def _flatten(routes: 'Sequence[BaseRoute] | None') -> 'list[Route]':
+    """Returns `routes` with each `Mount` replaced by its children, prefixed."""
+    flat: list[Route] = []
+    for route in routes or ():
+        if isinstance(route, Mount):
+            flat.extend(
+                Route(
+                    route.path + child.path,
+                    child.endpoint,
+                    methods=list(child.methods or ()),
+                )
+                for child in _flatten(route.routes)
+            )
+        elif isinstance(route, Route) and route.methods:
+            flat.append(route)
+        else:
+            raise TypeError(f'Unsupported A2A route: {route!r}')
+    return flat
+
+
 def _attach_route(
     app: 'FastAPI',
-    route: 'BaseRoute',
+    route: 'Route',
     tag: str,
     openapi_extra: dict[str, Any] | None,
     require_version_header: bool = False,
 ) -> None:
-    if not (isinstance(route, Route) and route.methods):
-        app.routes.append(route)
-        return
     # Drop HEAD: Starlette adds it alongside GET, but FastAPI registers duplicate operation IDs.
-    methods = sorted(m for m in route.methods if m != 'HEAD')
+    methods = sorted(m for m in route.methods or () if m != 'HEAD')
     if require_version_header:
         extra = dict(openapi_extra or {})
         extra.setdefault('parameters', [_A2A_VERSION_HEADER])
         openapi_extra = extra
-    app.routes.append(
-        _A2ARoute(
-            path=route.path,
-            endpoint=route.endpoint,
-            methods=methods,
-            tags=[tag],
-            openapi_extra=openapi_extra,
-        )
+    # add_api_route applies the app's dependencies, unlike appending a route.
+    app.router.add_api_route(
+        route.path,
+        route.endpoint,
+        methods=methods,
+        tags=[tag],
+        openapi_extra=openapi_extra,
     )
 
 
@@ -119,7 +128,8 @@ def add_a2a_routes_to_fastapi(
 
     Re-registers Starlette routes as ``APIRoute`` instances so they appear in
     the auto-generated OpenAPI schema, tagged and annotated with proto-derived
-    request-body schemas.
+    request-body schemas. App-level ``dependencies`` apply to every A2A route,
+    the agent card included.
 
     Usage::
 
@@ -161,30 +171,24 @@ def add_a2a_routes_to_fastapi(
         for key, cls in REST_BODY_TYPES.items()
     }
 
-    for route in agent_card_routes or ():
+    for route in _flatten(agent_card_routes):
         _attach_route(app, route, _AGENT_CARD_TAG, openapi_extra=None)
 
-    for route in jsonrpc_routes or ():
-        extra = jsonrpc_extra if isinstance(route, Route) else None
+    for route in _flatten(jsonrpc_routes):
         _attach_route(
             app,
             route,
             _JSONRPC_TAG,
-            openapi_extra=extra,
+            openapi_extra=jsonrpc_extra,
             require_version_header=True,
         )
 
-    for route in rest_routes or ():
-        extra = (
-            _rest_body_extra(route, rest_extras)
-            if isinstance(route, Route)
-            else None
-        )
+    for route in _flatten(rest_routes):
         _attach_route(
             app,
             route,
             _REST_TAG,
-            openapi_extra=extra,
+            openapi_extra=_rest_body_extra(route, rest_extras),
             require_version_header=True,
         )
 

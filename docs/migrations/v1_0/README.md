@@ -490,6 +490,8 @@ add_a2a_routes_to_fastapi(
 uvicorn.run(app, host=host, port=port)
 ```
 
+App-level `dependencies` (for example `FastAPI(dependencies=[Depends(check_api_key)])`) apply to every A2A route the helper adds, the public Agent Card included. To serve the Agent Card without them, register `agent_card_routes` on an app that has no such dependencies.
+
 > **Example**: [`a2a-mcp-without-framework/server/__main__.py` in PR #509](https://github.com/a2aproject/a2a-samples/pull/509/files#diff-d15d39ae64c3d4e3a36cc6fb442302caf4e32a6dbd858792e7a4bed180a625ac)
 
 ---
